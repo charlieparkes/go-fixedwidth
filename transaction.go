@@ -2,10 +2,12 @@ package fixedwidth
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charlieparkes/go-structs"
@@ -29,6 +31,7 @@ type Transaction struct {
 	Layout     Layout
 	fieldCache map[string]string
 	fieldNames map[string]pos
+	decodeHook mapstructure.DecodeHookFuncValue
 }
 
 type pos struct {
@@ -38,7 +41,7 @@ type pos struct {
 
 type Layout [][]Field
 
-var layoutCache map[string]*Layout = map[string]*Layout{}
+var layoutCache *sync.Map = &sync.Map{}
 
 // NewTransaction allocates a new transaction and generates its layout using the target struct.
 func NewTransaction(target interface{}) (*Transaction, error) {
@@ -49,8 +52,8 @@ func NewTransaction(target interface{}) (*Transaction, error) {
 
 	// Cache layouts
 	layoutName := structs.Name(target)
-	if layout, ok := layoutCache[layoutName]; ok {
-		t.Layout = *layout
+	if layout, ok := layoutCache.Load(layoutName); ok {
+		t.Layout = *layout.(*Layout)
 		return t, nil
 	}
 
@@ -81,9 +84,14 @@ func NewTransaction(target interface{}) (*Transaction, error) {
 		}
 	}
 
-	layoutCache[layoutName] = &t.Layout
+	layoutCache.Store(layoutName, &t.Layout)
 
 	return t, nil
+}
+
+func (t *Transaction) WithDecodeHook(hook mapstructure.DecodeHookFuncValue) *Transaction {
+	t.decodeHook = hook
+	return t
 }
 
 // Append adds a record byte string to the transaction.
@@ -211,6 +219,15 @@ func (t *Transaction) Unmarshal(output interface{}) error {
 	}
 
 	decodeHook := func(from reflect.Value, to reflect.Value) (interface{}, error) {
+		// If user provided custom hook for their specific use case, run that first.
+		if t.decodeHook != nil {
+			val, err := t.decodeHook(from, to)
+			if err != nil {
+				return val, err
+			}
+			from = reflect.ValueOf(val)
+		}
+
 		toKind := to.Kind()
 		if from.Kind() == reflect.String {
 			fromStr := from.String()
@@ -220,13 +237,26 @@ func (t *Transaction) Unmarshal(output interface{}) error {
 				return nil, nil
 			}
 
+			fromIface := from.Interface()
+
 			switch to.Interface().(type) {
 			case time.Time, *time.Time:
+				if fromStr == "" {
+					return time.Time{}, nil
+				}
 				val, err := time.Parse(dateLayout, fromStr)
 				if toKind == reflect.Ptr {
 					return &val, err
 				}
 				return val, err
+			}
+
+			result := reflect.New(to.Type()).Interface()
+			if scannable, ok := result.(sql.Scanner); ok {
+				err := scannable.Scan(fromIface)
+				if err == nil {
+					return result, nil
+				}
 			}
 
 			// Remove leading zeros from int types so ParseInt won't assume it's an octal.
@@ -243,11 +273,11 @@ func (t *Transaction) Unmarshal(output interface{}) error {
 		Result:           output,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize decoder: %w", err)
 	}
 
 	if err := decoder.Decode(fields); err != nil {
-		return err
+		return fmt.Errorf("failed to decode transaction: %w", err)
 	}
 
 	return nil
@@ -258,37 +288,39 @@ func (t *Transaction) UnmarshalLines(lines [][]byte, output interface{}) error {
 	return t.Unmarshal(output)
 }
 
+func MarshalDecodeHook(from reflect.Value, to reflect.Value, tags map[string]string) (interface{}, error) {
+	if from.Kind() == reflect.Ptr && from.IsNil() {
+		return "", nil
+	}
+
+	switch from.Interface().(type) {
+	case time.Time, *time.Time:
+		layout := time.RFC3339
+		if val, ok := tags["time"]; ok {
+			layout = val
+		}
+		if from.Kind() == reflect.Ptr {
+			return from.Interface().(*time.Time).Format(layout), nil
+		}
+		return from.Interface().(time.Time).Format(layout), nil
+	}
+
+	// For generated enums
+	if val, ok := from.Interface().(interface{ Symbol() string }); ok {
+		return val.Symbol(), nil
+	}
+
+	return from.Interface(), nil
+}
+
 func (t *Transaction) Marshal(input interface{}) error {
 	output := map[string]string{}
-
-	decodeHook := func(from reflect.Value, to reflect.Value, tags map[string]string) (interface{}, error) {
-		if from.Kind() == reflect.Ptr && from.IsNil() {
-			return "", nil
-		}
-
-		switch from.Interface().(type) {
-		case time.Time, *time.Time:
-			layout := time.RFC3339
-			if val, ok := tags["time"]; ok {
-				layout = val
-			}
-			if from.Kind() == reflect.Ptr {
-				return from.Interface().(*time.Time).Format(layout), nil
-			}
-			return from.Interface().(time.Time).Format(layout), nil
-		}
-
-		return from.Interface(), nil
-	}
-
-	if err := structs.FillMap(input, output, "txn", decodeHook); err != nil {
+	if err := structs.FillMap(input, output, "txn", MarshalDecodeHook); err != nil {
 		return err
 	}
-
 	if err := t.SetFields(output); err != nil {
 		return err
 	}
-
 	return nil
 }
 
